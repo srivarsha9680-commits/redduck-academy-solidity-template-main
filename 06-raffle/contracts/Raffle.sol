@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
@@ -6,15 +7,6 @@ import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFCo
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-// Raffle - players deposit a volatile token; each deposit's USD value at entry
-// time (from a Chainlink price feed) sets its win probability. After drawTime a
-// Chainlink VRF draw picks a weighted winner, who claims the whole pot.
-//
-// Randomness is asynchronous: drawWinner() requests a random word and returns
-// immediately; the VRF coordinator calls fulfillRandomWords() back some blocks
-// later. The data structure for the weighted draw and the claim verification are
-// yours to design - you may not import a library that solves the weighted-draw
-// or random-selection problem. See TASK.md for the full behavior spec.
 contract Raffle is VRFConsumerBaseV2Plus {
     struct Entry {
         address player;
@@ -22,22 +14,28 @@ contract Raffle is VRFConsumerBaseV2Plus {
         uint256 cumulativeEnd;
     }
 
-    IERC20 public immutable token; // deposit token
-    AggregatorV3Interface public immutable priceFeed; // token/USD feed
+    IERC20 public immutable token;
+    AggregatorV3Interface public immutable priceFeed;
     uint256 public immutable drawTime;
 
     uint256 public immutable subscriptionId;
     bytes32 public immutable keyHash;
     uint32 public immutable callbackGasLimit;
+
     uint16 public constant REQUEST_CONFIRMATIONS = 3;
     uint32 public constant NUM_WORDS = 1;
-
-    uint256 public constant MAX_PRICE_AGE = 1 hours; // feed staleness bound
+    uint256 public constant MAX_PRICE_AGE = 1 hours;
 
     Entry[] public entries;
+
     uint256 public totalWeight;
+    uint256 public totalDeposited;
+
     uint256 public requestId;
     uint256 public randomWord;
+
+    address public winner;
+
     bool public drawRequested;
     bool public randomWordReceived;
     bool public claimed;
@@ -71,9 +69,6 @@ contract Raffle is VRFConsumerBaseV2Plus {
         callbackGasLimit = _callbackGasLimit;
     }
 
-    /// @notice Join the raffle by depositing tokens while it is open. The deposit's
-    ///         weight is its USD value at the current feed price, fixed at entry.
-    ///         Reject prices that are missing, non-positive, or stale.
     function deposit(uint256 amount) external {
         if (amount == 0 || block.timestamp >= drawTime || drawRequested) {
             revert InvalidDeposit();
@@ -98,23 +93,31 @@ contract Raffle is VRFConsumerBaseV2Plus {
         }
 
         uint256 weight = amount * uint256(answer);
+
         uint256 start = totalWeight;
         uint256 end = start + weight;
 
-        entries.push(Entry({player: msg.sender, cumulativeStart: start, cumulativeEnd: end}));
-        totalWeight = end;
-
         token.transferFrom(msg.sender, address(this), amount);
+
+        entries.push(
+            Entry({
+                player: msg.sender,
+                cumulativeStart: start,
+                cumulativeEnd: end
+            })
+        );
+
+        totalWeight = end;
+        totalDeposited += amount;
 
         emit Deposited(msg.sender, amount, weight);
     }
 
-    /// @notice After drawTime, with at least one deposit, request a single random
-    ///         word from VRF and track the returned request id. Only once.
     function drawWinner() external returns (uint256) {
         if (block.timestamp < drawTime || entries.length == 0) {
             revert DrawNotReady();
         }
+
         if (drawRequested) {
             revert DrawAlreadyRequested();
         }
@@ -129,18 +132,20 @@ contract Raffle is VRFConsumerBaseV2Plus {
                 callbackGasLimit: callbackGasLimit,
                 numWords: NUM_WORDS,
                 extraArgs: VRFV2PlusClient._argsToBytes(
-                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                    VRFV2PlusClient.ExtraArgsV1({
+                        nativePayment: false
+                    })
                 )
             })
         );
 
         requestId = reqId;
+
         emit DrawRequested(reqId);
+
         return reqId;
     }
 
-    /// @notice VRF callback. Confirm the request id matches and record the random
-    ///         word - nothing more. No transfers, no loops, no settlement here.
     function fulfillRandomWords(
         uint256 _requestId,
         uint256[] calldata randomWords
@@ -153,15 +158,17 @@ contract Raffle is VRFConsumerBaseV2Plus {
         randomWordReceived = true;
     }
 
-    /// @notice After the random word arrives, the winner claims the prize. The
-    ///         caller supplies the index of the winning entry; verify it belongs
-    ///         to msg.sender and is the winning entry, else revert InvalidClaim.
     function claim(uint256 entryIndex) external {
-        if (!randomWordReceived || claimed || entryIndex >= entries.length) {
+        if (
+            !randomWordReceived ||
+            claimed ||
+            entryIndex >= entries.length
+        ) {
             revert InvalidClaim();
         }
 
         uint256 winningTicket = randomWord % totalWeight;
+
         Entry storage entry = entries[entryIndex];
 
         if (
@@ -173,7 +180,10 @@ contract Raffle is VRFConsumerBaseV2Plus {
         }
 
         claimed = true;
+        winner = msg.sender;
+
         uint256 prize = token.balanceOf(address(this));
+
         token.transfer(msg.sender, prize);
 
         emit WinnerPicked(msg.sender);
